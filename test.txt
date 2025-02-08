@@ -1,0 +1,220 @@
+#include <cstdio>
+/*-------------FreeRTOS Includes--------------*/
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h"
+#include "timers.h"
+#include "semphr.h"
+
+/********Tensorflow lite micro include *************/
+#include "micro/micro_mutable_op_resolver.h"
+#include "micro/tflite_bridge/micro_error_reporter.h"
+#include "micro/micro_interpreter.h"
+#include "schema/schema_generated.h"
+
+// /*-------------Custom Driver Includes--------------*/
+#include "gpio.h"
+#include "uart.h"
+#include "i2c.h"
+#include "mpu6050.h"
+#include "model.h"
+#include "DataNormalization.hh"
+// Flags to control the code flow
+uint8_t isSampling = 0;
+uint8_t isNormalizing = 0;
+uint8_t isProcessing = 0;
+uint8_t isReady = 0;
+
+// Array for store sensor data
+float AccelDataArr[3];
+float GyroDataArr[3];
+
+#define DATA_ARR_MAX_SIZE 20
+// all the Sampling Value
+MPU6050_Data DataArr[DATA_ARR_MAX_SIZE];
+uint8_t DataArrSize = 0;
+
+MPU6050_Data NormData;
+
+void BuiltInBtnExtiInit();
+
+// TensorFlow Lite Micro objects
+tflite::MicroErrorReporter micro_error_reporter;
+tflite::ErrorReporter *error_reporter = &micro_error_reporter;
+
+const tflite::Model *model = ::tflite::GetModel(model_tflite);
+
+using GestureOpResolver = tflite::MicroMutableOpResolver<1>;
+
+GestureOpResolver resolver;
+
+TfLiteStatus RegisterOps(GestureOpResolver &op_resolver)
+{
+    TF_LITE_ENSURE_STATUS(op_resolver.AddFullyConnected());
+    return kTfLiteOk;
+}
+
+const int tensor_arena_size = 2 * 4096U;
+uint8_t tensor_arena[tensor_arena_size];
+
+tflite::MicroInterpreter interpreter(model, resolver, tensor_arena, tensor_arena_size);
+
+TfLiteTensor *input = interpreter.input(0);
+TfLiteTensor *output = interpreter.output(0);
+
+void USART2_Config(); // Configuring UART to send data to the computer
+
+int main(void)
+{
+    UART2_GPIO_Init();
+    USART2_Config();
+
+    BuiltInBtnExtiInit();
+
+    // Check TensorFlow Lite schema version
+    if (model->version() != TFLITE_SCHEMA_VERSION)
+    {
+        TF_LITE_REPORT_ERROR(error_reporter,
+                             "Model provided is schema version %d not equal "
+                             "to supported version %d.\n",
+                             model->version(), TFLITE_SCHEMA_VERSION);
+    }
+    else
+    {
+        UART_SendBuffer(USART2, (uint8_t *)"Version Matched\n", 20);
+    }
+
+    // Register operations
+    RegisterOps(resolver);
+
+    // Allocate tensors
+    TF_LITE_ENSURE_STATUS(interpreter.AllocateTensors());
+
+    // xTaskCreate(pvSamplingTask, "Sampling Task", configMINIMAL_STACK_SIZE + 256, NULL, 1, NULL);
+    // xTaskCreate(pvDataNormTask, "Normalization Task", configMINIMAL_STACK_SIZE + 256, NULL, 2, NULL);
+    // xTaskCreate(pvDataProcessTask, "Processing Task", configMINIMAL_STACK_SIZE + 512, NULL, 3, NULL);
+
+    vTaskStartScheduler();
+
+    while (1)
+    {
+    }
+
+    return 0;
+}
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName) // Stack Overflow Hook
+{
+    /* Print or log stack overflow for task debugging */
+    for (;;)
+        ; // Halt system to debug
+}
+
+void USART2_Config()
+{
+    UARTConfig_t uart2;                       // Creating UART Instance
+    uart2.pUARTx = USART2;                    // Adding USART peripheral to the instance
+    uart2.Init.BaudRate = 115200U;            // Configuring Baud Rate
+    uart2.Init.Mode = UART_MODE_TX_ONLY;      // Configuring Mode/Direction
+    uart2.Init.Parity = UART_PARITY_NONE;     // Configuring Parity Control
+    uart2.Init.WordLen = UART_WORD_LEN_8BITS; // Configuring Word length
+    UART_Init(&uart2);
+}
+
+extern "C" int __io_putchar(int ch) // Overwriting for use printf via UART
+{
+    UART_SendChar(USART2, ch);
+    return ch;
+}
+
+void pvSamplingTask(void *pvParams)
+{
+    MPU6050_Data data;
+    while (true)
+    {
+        if (isSampling)
+        {
+            MPU_Read_Accel(AccelDataArr);
+            MPU_Read_Gyro(GyroDataArr);
+            data.Ax = AccelDataArr[0];
+            data.Ay = AccelDataArr[1];
+            data.Az = AccelDataArr[2];
+            data.Gx = GyroDataArr[0];
+            data.Gy = GyroDataArr[1];
+            data.Gz = GyroDataArr[2];
+            if (DataArrSize < DATA_ARR_MAX_SIZE)
+            {
+                DataArr[DataArrSize] = data;
+                DataArrSize++;
+            }
+            else
+            {
+                isNormalizing = 1;
+            }
+        }
+    }
+}
+
+void pvDataNormTask(void *pvParams)
+{
+    while (true)
+    {
+        if (isNormalizing)
+        {
+            NormalizeData(DataArr, DataArrSize, NormData);
+            isProcessing = 1;
+            isNormalizing = 0;
+        }
+    }
+}
+
+void pvDataProcessTask(void *pvParams)
+{
+    while (true)
+    {
+        if (isProcessing)
+        {
+            input->data.f[0] = NormData.Ax;
+            input->data.f[1] = NormData.Ay;
+            input->data.f[2] = NormData.Az;
+            input->data.f[3] = NormData.Gx;
+            input->data.f[4] = NormData.Gy;
+            input->data.f[5] = NormData.Gz;
+            interpreter.Invoke();
+            isProcessing = 0;
+            isReady = 1;
+        }
+    }
+}
+void pvDataLoggingTask()
+{
+    if (isReady)
+    {
+    }
+}
+void BuiltInBtnExtiInit()
+{
+    RCC->AHB1ENR |= RCC_AHB1ENR_GPIOCEN | RCC_AHB1ENR_GPIOAEN;
+    RCC->APB2ENR |= RCC_APB2ENR_SYSCFGEN;
+
+    GPIOA->MODER |= 1 << 10;
+    GPIOC->MODER &= 3U << 26;
+    GPIOC->PUPDR |= 1 << 26;
+
+    SYSCFG->EXTICR[3] = 2 << 4;
+
+    EXTI->IMR |= 1 << 13;
+    EXTI->FTSR |= 1 << 13;
+    NVIC_EnableIRQ(EXTI15_10_IRQn);
+}
+
+extern "C" void EXTI15_10_IRQHandler()
+{
+    if (EXTI->PR & (1 << 13))
+    {
+        EXTI->PR |= 1 << 13;
+        GPIOA->ODR ^= 1 << 5;
+
+        isSampling != isSampling;
+    }
+}
